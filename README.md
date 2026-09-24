@@ -36,14 +36,14 @@ sudo ./target/release/pulsar-star
 
 | Flag                              | Description                                                      | Default       |
 | --------------------------------- | ---------------------------------------------------------------- | ------------- |
-| `-s`, `--sleep <ms>` (optional)   | Delay in milliseconds between each full sweep of the target list | `100`         |
-| `-g`, `--gateway <ip>` (optional) | real arp gateway ip                                              | `192.168.1.1` |
+| `-s`, `--sleep <µs>` (optional)   | Delay in milliseconds between each full sweep of the target list | `100`         |
+| `-g`, `--gateway <ip>` (optional) | arp gateway                                                      | `192.168.1.1` |
 | `-t`, `--thread <num>` (optional) | which thread to pinned the proccess                              | `1`           |
 
 Example:
 
 ```sh
-sudo ./target/release/pulsar-star -s 500 -g 192.168.0.0 -t 1
+sudo ./target/release/pulsar-star -s 300 -g 192.168.0.0 -t 1
 ```
 
 ## Project layout
