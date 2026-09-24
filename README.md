@@ -62,6 +62,6 @@ sudo ./target/release/pulsar-star -s 500 -g 192.168.0.0 -t 1
 - `clap` / `clap_derive` — command-line argument parsing
 - `libc` — CPU affinity syscalls
 
-## Status
+## Status(No AI involved)
 
 Early-stage / experimental personal project.
