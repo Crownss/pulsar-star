@@ -36,7 +36,7 @@ sudo ./target/release/pulsar-star
 
 | Flag                              | Description                                                      | Default       |
 | --------------------------------- | ---------------------------------------------------------------- | ------------- |
-| `-s`, `--sleep <µs>` (optional)   | Delay in milliseconds between each full sweep of the target list | `100`         |
+| `-s`, `--sleep <µs>` (optional)   | Delay in microseconds between each full sweep of the target list | `200`         |
 | `-g`, `--gateway <ip>` (optional) | arp gateway                                                      | `192.168.1.1` |
 | `-t`, `--thread <num>` (optional) | which thread to pinned the proccess                              | `1`           |
 
