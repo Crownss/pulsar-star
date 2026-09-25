@@ -31,7 +31,7 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub no_sleep: bool,
     /// Whitelisted ip to exclude
-    #[arg(short, long)]
+    #[arg(short, long, num_args = 1..)]
     pub whitelist: Option<Vec<String>>,
 }
 
