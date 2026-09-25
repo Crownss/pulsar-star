@@ -30,6 +30,9 @@ pub struct Args {
     /// Careful to use this, if -s/--sleep is set will be ignore
     #[arg(long, default_value_t = false)]
     pub no_sleep: bool,
+    /// Whitelisted ip to exclude
+    #[arg(short, long)]
+    pub whitelist: Option<Vec<String>>,
 }
 
 fn init() {
@@ -47,6 +50,11 @@ fn main() {
     let mut all_ips = get_all_ips();
     let self_device = &*SELF_INFO;
     all_ips.retain(|ip| *ip != self_device.0);
+    if let Some(whitelist_ip) = &ARGS.whitelist {
+        for wip in whitelist_ip {
+            all_ips.retain(|ip| *ip != wip.parse::<Ipv4Addr>().unwrap());
+        }
+    };
 
     println!("targeted to all ip: {:?}", all_ips);
     if all_ips.is_empty() {
